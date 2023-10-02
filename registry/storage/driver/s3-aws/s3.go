@@ -1256,10 +1256,11 @@ func (d *driver) getStorageClass() *string {
 // cleanly resumed in the future. This is violated if Close is called after less
 // than a full chunk is written.
 type writer struct {
-	driver      *driver
-	key         string
-	uploadID    string
-	parts       []*s3.Part
+	driver   *driver
+	key      string
+	uploadID string
+	parts    []*s3.Part
+
 	size        int64
 	readyPart   []byte
 	pendingPart []byte
@@ -1380,37 +1381,57 @@ func (w *writer) Write(p []byte) (int, error) {
 
 	var n int
 
+	chunkSize := int(w.driver.ChunkSize)
+	expectedParts := (len(p) % chunkSize) + 1
+	bytesWritten := make(chan int, expectedParts)
+	errChan := make(chan error, expectedParts)
 	for len(p) > 0 {
-		// If no parts are ready to write, fill up the first part
-		if neededBytes := int(w.driver.ChunkSize) - len(w.readyPart); neededBytes > 0 {
-			if len(p) >= neededBytes {
-				w.readyPart = append(w.readyPart, p[:neededBytes]...)
-				n += neededBytes
-				p = p[neededBytes:]
-			} else {
-				w.readyPart = append(w.readyPart, p...)
-				n += len(p)
-				p = nil
-			}
-		}
-
-		if neededBytes := int(w.driver.ChunkSize) - len(w.pendingPart); neededBytes > 0 {
-			if len(p) >= neededBytes {
-				w.pendingPart = append(w.pendingPart, p[:neededBytes]...)
-				n += neededBytes
-				p = p[neededBytes:]
-				err := w.flushPart()
-				if err != nil {
-					w.size += int64(n)
-					return n, err
-				}
-			} else {
-				w.pendingPart = append(w.pendingPart, p...)
-				n += len(p)
-				p = nil
-			}
+		if len(p) >= chunkSize {
+			readyPart := p[:chunkSize]
+			go w.flush(readyPart, bytesWritten, errChan)
+			p = p[chunkSize:]
 		}
 	}
+
+	for i := 0; i < expectedParts; i++ {
+		err := <-errChan
+		val := <-bytesWritten
+		n += val
+		if err != nil {
+			return n, err
+		}
+	}
+
+	//	// If no parts are ready to write, fill up the first part
+	//	if neededBytes := int(w.driver.ChunkSize) - len(w.readyPart); neededBytes > 0 {
+	//		if len(p) >= neededBytes {
+	//			w.readyPart = append(w.readyPart, p[:neededBytes]...)
+	//			n += neededBytes
+	//			p = p[neededBytes:]
+	//		} else {
+	//			w.readyPart = append(w.readyPart, p...)
+	//			n += len(p)
+	//			p = nil
+	//		}
+	//	}
+	//
+	//	if neededBytes := int(w.driver.ChunkSize) - len(w.pendingPart); neededBytes > 0 {
+	//		if len(p) >= neededBytes {
+	//			w.pendingPart = append(w.pendingPart, p[:neededBytes]...)
+	//			n += neededBytes
+	//			p = p[neededBytes:]
+	//			err := w.flushPart()
+	//			if err != nil {
+	//				w.size += int64(n)
+	//				return n, err
+	//			}
+	//		} else {
+	//			w.pendingPart = append(w.pendingPart, p...)
+	//			n += len(p)
+	//			p = nil
+	//		}
+	//	}
+	//}
 	w.size += int64(n)
 	return n, nil
 }
@@ -1509,6 +1530,23 @@ func (w *writer) Commit() error {
 	return nil
 }
 
+func (w *writer) flush(b []byte, bytesWritten chan<- int, errs chan<- error) {
+	partNumber := aws.Int64(int64(len(w.parts) + 1))
+	resp, err := w.uploadPart(partNumber)
+	if err != nil {
+		errs <- err
+		return
+	}
+	bytesWritten <- len(b)
+
+	w.parts = append(w.parts, &s3.Part{
+		ETag:       resp.ETag,
+		PartNumber: partNumber,
+		Size:       aws.Int64(int64(len(w.readyPart))),
+	})
+
+}
+
 // flushPart flushes buffers to write a part to S3.
 // Only called by Write (with both buffers full) and Close/Commit (always)
 func (w *writer) flushPart() error {
@@ -1524,13 +1562,7 @@ func (w *writer) flushPart() error {
 	}
 
 	partNumber := aws.Int64(int64(len(w.parts) + 1))
-	resp, err := w.driver.S3.UploadPart(&s3.UploadPartInput{
-		Bucket:     aws.String(w.driver.Bucket),
-		Key:        aws.String(w.key),
-		PartNumber: partNumber,
-		UploadId:   aws.String(w.uploadID),
-		Body:       bytes.NewReader(w.readyPart),
-	})
+	resp, err := w.uploadPart(partNumber)
 	if err != nil {
 		return err
 	}
@@ -1542,4 +1574,15 @@ func (w *writer) flushPart() error {
 	w.readyPart = w.pendingPart
 	w.pendingPart = nil
 	return nil
+}
+
+func (w *writer) uploadPart(partNumber *int64) (*s3.UploadPartOutput, error) {
+	resp, err := w.driver.S3.UploadPart(&s3.UploadPartInput{
+		Bucket:     aws.String(w.driver.Bucket),
+		Key:        aws.String(w.key),
+		PartNumber: partNumber,
+		UploadId:   aws.String(w.uploadID),
+		Body:       bytes.NewReader(w.readyPart),
+	})
+	return resp, err
 }
